@@ -10,17 +10,25 @@
 
 import chalk from "chalk"
 import { renderMarkdown, renderMarkdownStreaming } from "./markdown.js"
+import { stripAnsi } from "./utils.js"
 import type {
   SDKMessage,
   SDKAssistantMessage,
   SDKUserMessage,
   SDKResultMessage,
+  SDKResultSuccessMessage,
   SDKStreamEventMessage,
   SDKToolProgressMessage,
   SDKSystemMessage,
+  SDKSystemInitMessage,
+  SDKSystemStatusMessage,
+  SDKSystemTaskStartedMessage,
+  SDKSystemTaskNotificationMessage,
   SDKControlRequestMessage,
   ContentBlock,
   ToolUseBlock,
+  ToolResultBlock,
+  MessageDeltaEvent,
 } from "./types.js"
 
 // ─── Theme (dark) ───
@@ -38,11 +46,10 @@ const C = {
 
 const INDENT = "  "
 const DOT = "●"
-const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g
 
-function stripAnsi(s: string): string {
-  return s.replace(ANSI_RE, "")
-}
+/** Tools that collapse into a summary when multiple appear in one group. */
+const COLLAPSIBLE_TOOLS = new Set(["Read", "Grep", "Glob"])
+
 
 // ─── State ───
 
@@ -55,24 +62,19 @@ interface ToolOp {
   isError?: boolean
 }
 
-// All tool ops in the current group (one assistant turn's tool calls)
+type SpinnerMode = "thinking" | "talking" | "tool-input" | "tool-use"
+
 let toolGroup: ToolOp[] = []
-// Map tool_use_id → ToolOp for result matching
 let toolById = new Map<string, ToolOp>()
-// id of the currently streaming tool (receiving input_json_delta)
 let activeToolId = ""
-// Whether we've displayed any text this session
 let textStarted = false
-// Line buffer for streaming text output
 let textLineBuf = ""
-// Whether the spinner line is currently drawn (needs clearing)
 let spinnerActive = false
-// Turn start time for elapsed display
 let turnStartMs = 0
-// Accumulated output tokens this turn
 let outputTokens = 0
-// Spinner interval handle
 let spinnerTimer: ReturnType<typeof setInterval> | null = null
+let spinnerMode: SpinnerMode = "thinking"
+let spinnerToolName = ""
 
 export function resetState() {
   toolGroup = []
@@ -83,17 +85,33 @@ export function resetState() {
   spinnerActive = false
   turnStartMs = 0
   outputTokens = 0
+  spinFrame = 0
+  spinnerMode = "thinking"
+  spinnerToolName = ""
   stopSpinner()
 }
 
 // ─── Spinner ───
 
-function startSpinner() {
+function startSpinner(mode: SpinnerMode = "thinking", toolName = "") {
+  spinnerMode = mode
+  spinnerToolName = toolName
   if (spinnerTimer) return
   turnStartMs = Date.now()
   outputTokens = 0
   spinnerTimer = setInterval(drawSpinner, 100)
   drawSpinner()
+}
+
+function updateSpinnerMode(mode: SpinnerMode, toolName = "") {
+  if (spinnerMode === mode && spinnerToolName === toolName && spinnerTimer) return
+  spinnerMode = mode
+  spinnerToolName = toolName
+  if (spinnerTimer) {
+    drawSpinner()
+  } else {
+    startSpinner(mode, toolName)
+  }
 }
 
 function stopSpinner() {
@@ -114,8 +132,25 @@ function drawSpinner() {
   const frame = SPIN_FRAMES[spinFrame]
   const elapsed = ((Date.now() - turnStartMs) / 1000).toFixed(1)
   const tokens = outputTokens > 0 ? ` · ${outputTokens} tokens` : ""
-  const line = C.dim(`${frame} thinking · ${elapsed}s${tokens}`)
-  process.stderr.write(`\r${line}\r`)
+
+  let label: string
+  switch (spinnerMode) {
+    case "thinking":
+      label = "thinking"
+      break
+    case "talking":
+      label = "talking"
+      break
+    case "tool-input":
+      label = spinnerToolName ? `${spinnerToolName}` : "tool input"
+      break
+    case "tool-use":
+      label = spinnerToolName ? `Running ${spinnerToolName}` : "running tools"
+      break
+  }
+
+  const line = C.dim(`${frame} ${label} · ${elapsed}s${tokens}`)
+  process.stderr.write(`\r\x1b[2K${line}\r`)
   spinnerActive = true
 }
 
@@ -139,6 +174,7 @@ function flushTextParagraphs() {
 }
 
 function write(s: string) {
+  if (spinnerActive) clearSpinnerLine()
   process.stdout.write(s)
 }
 
@@ -158,14 +194,14 @@ function flushToolGroup() {
   // Separate: Bash/others always render individually, Read/Grep/Glob can collapse
   const individual: ToolOp[] = []
   const collapsible: ToolOp[] = []
-  let searches = 0, reads = 0, lists = 0
+  const counts = new Map<string, number>()
 
   for (const op of toolGroup) {
-    switch (op.name) {
-      case "Grep":   collapsible.push(op); searches++; break
-      case "Glob":   collapsible.push(op); lists++;    break
-      case "Read":   collapsible.push(op); reads++;    break
-      default:       individual.push(op);              break
+    if (COLLAPSIBLE_TOOLS.has(op.name)) {
+      collapsible.push(op)
+      counts.set(op.name, (counts.get(op.name) ?? 0) + 1)
+    } else {
+      individual.push(op)
     }
   }
 
@@ -177,6 +213,9 @@ function flushToolGroup() {
   // Collapse Read/Grep/Glob when more than one
   if (collapsible.length > 1) {
     const parts: string[] = []
+    const searches = counts.get("Grep") ?? 0
+    const reads    = counts.get("Read") ?? 0
+    const lists    = counts.get("Glob") ?? 0
     if (searches > 0) parts.push(`Searched for ${searches} pattern${searches > 1 ? "s" : ""}`)
     if (reads > 0)    parts.push(`read ${reads} file${reads > 1 ? "s" : ""}`)
     if (lists > 0)    parts.push(`listed ${lists} director${lists > 1 ? "ies" : "y"}`)
@@ -198,18 +237,15 @@ function renderSingleToolOp(op: ToolOp) {
   const detailPart = details ? ` ${C.gray(details)}` : ""
 
   const dotColor = op.isError ? C.error : C.success
+  writeLine(`${dotColor(DOT)} ${namePart}${detailPart}`)
 
   if (op.result !== undefined) {
-    writeLine(`${dotColor(DOT)} ${namePart}${detailPart}`)
     const summary = summarizeResult(op.name, op.result, op.isError)
     if (summary) {
-      const lines = summary.split("\n")
-      for (const line of lines) {
+      for (const line of summary.split("\n")) {
         writeLine(C.dim(`${INDENT}⎿  ${line}`))
       }
     }
-  } else {
-    writeLine(`${dotColor(DOT)} ${namePart}${detailPart}`)
   }
 }
 
@@ -232,20 +268,23 @@ export function render(msg: SDKMessage): void {
 function renderSystem(msg: SDKSystemMessage) {
   switch (msg.subtype) {
     case "init": {
-      const model = stripAnsi((msg as any).model ?? "unknown")
-      writeLine(C.dim(`Model: ${model}`))
+      const initMsg = msg as SDKSystemInitMessage
+      const model = stripAnsi(initMsg.model ?? "unknown")
+      writeLine(C.dim(`Model: ${model}  Session: ${initMsg.session_id}`))
       break
     }
     case "status":
-      if ((msg as any).status === "compacting") {
+      if ((msg as SDKSystemStatusMessage).status === "compacting") {
         writeLine(C.dim(`${INDENT}Compacting context...`))
       }
       break
-    case "task_started":
-      writeLine(C.dim(`${INDENT}◷ Task: ${(msg as any).description?.slice(0, 80) ?? "..."}`))
+    case "task_started": {
+      const tsMsg = msg as SDKSystemTaskStartedMessage
+      writeLine(C.dim(`${INDENT}◷ Task: ${tsMsg.description?.slice(0, 80) ?? "..."}`))
       break
+    }
     case "task_notification": {
-      const tn = msg as any
+      const tn = msg as SDKSystemTaskNotificationMessage
       const icon = tn.status === "completed" ? "✓" : tn.status === "failed" ? "✗" : "○"
       const summary = tn.summary ? `: ${tn.summary.slice(0, 80)}` : ""
       writeLine(C.dim(`${INDENT}${icon} Task ${tn.task_id?.slice(0, 8) ?? ""}${summary}`))
@@ -259,7 +298,8 @@ function renderStreamEvent(msg: SDKStreamEventMessage) {
 
   switch (event.type) {
     case "message_start": {
-      // New API turn starts — start spinner
+      // Defensive: flush stale toolGroup from a previous interrupted turn
+      if (toolGroup.length > 0) flushToolGroup()
       startSpinner()
       break
     }
@@ -272,9 +312,10 @@ function renderStreamEvent(msg: SDKStreamEventMessage) {
         const op: ToolOp = { id: tool.id, name: tool.name, inputJson: "", input: {} }
         toolGroup.push(op)
         toolById.set(tool.id, op)
+        updateSpinnerMode("tool-input", toolDisplayName(tool.name))
       } else if (block.type === "text") {
-        // Text starting — stop spinner, flush accumulated tool group from prev turn
-        stopSpinner()
+        // Text starting — switch to talking spinner, flush accumulated tool group from prev turn
+        updateSpinnerMode("talking")
         if (toolGroup.length > 0) {
           // Only flush if all ops have results (i.e. this is the response turn after tools)
           // If no results yet, defer to user message handling
@@ -293,13 +334,9 @@ function renderStreamEvent(msg: SDKStreamEventMessage) {
     case "content_block_delta": {
       const delta = event.delta
       if (delta.type === "text_delta" && delta.text) {
-        stopSpinner()
+        updateSpinnerMode("talking")
         textLineBuf += delta.text
-        // Flush on paragraph boundary (double newline)
         flushTextParagraphs()
-      } else if (delta.type === "thinking_delta") {
-        // Count thinking tokens for spinner display
-        outputTokens++
       } else if (delta.type === "input_json_delta" && delta.partial_json) {
         // Accumulate tool input JSON
         const op = toolById.get(activeToolId)
@@ -311,7 +348,6 @@ function renderStreamEvent(msg: SDKStreamEventMessage) {
     }
 
     case "content_block_stop": {
-      // Tool input fully streamed — parse it
       const op = toolById.get(activeToolId)
       if (op && op.inputJson) {
         try {
@@ -325,16 +361,14 @@ function renderStreamEvent(msg: SDKStreamEventMessage) {
     }
 
     case "message_delta": {
-      // Track output token count for spinner
-      const usage = (event as any).usage
-      if (usage?.output_tokens) {
-        outputTokens = usage.output_tokens
+      const deltaEvent = event as MessageDeltaEvent
+      if (deltaEvent.usage?.output_tokens) {
+        outputTokens = deltaEvent.usage.output_tokens
       }
       break
     }
 
     case "message_stop": {
-      stopSpinner()
       // Render remaining text as markdown
       if (textLineBuf) {
         const rendered = renderMarkdown(textLineBuf)
@@ -346,6 +380,14 @@ function renderStreamEvent(msg: SDKStreamEventMessage) {
       if (textStarted) {
         write("\n")
         textStarted = false
+      }
+      // If tools are pending execution, switch spinner to "tool-use" mode
+      const pendingTools = toolGroup.filter(o => o.result === undefined)
+      if (pendingTools.length > 0) {
+        const names = [...new Set(pendingTools.map(o => toolDisplayName(o.name)))]
+        updateSpinnerMode("tool-use", names.join(", "))
+      } else {
+        stopSpinner()
       }
       break
     }
@@ -402,9 +444,8 @@ function renderUser(msg: SDKUserMessage) {
 function renderToolProgress(msg: SDKToolProgressMessage) {
   // Only show for long-running non-collapsible tools
   const name = msg.tool_name
-  if (!["Read", "Grep", "Glob"].includes(name)) {
+  if (!COLLAPSIBLE_TOOLS.has(name)) {
     const elapsed = formatDuration(msg.elapsed_time_seconds * 1000)
-    clearSpinnerLine()
     writeLine(C.dim(`${INDENT}${INDENT}↳ ${name} running... (${elapsed})`))
   }
 }
@@ -431,8 +472,7 @@ function renderResult(msg: SDKResultMessage) {
   const apiDuration = formatDuration(msg.duration_api_ms)
   const cost        = `$${msg.total_cost_usd.toFixed(4)}`
 
-  // Token stats
-  const usage = (msg as any).usage
+  const usage = msg.subtype === "success" ? (msg as SDKResultSuccessMessage).usage : undefined
   const input   = usage?.input_tokens ?? 0
   const output  = usage?.output_tokens ?? 0
   const cacheR  = usage?.cache_read_input_tokens ?? 0
@@ -446,25 +486,28 @@ function renderResult(msg: SDKResultMessage) {
 
   writeLine(C.dim(`  ${duration} (API ${apiDuration}) · ${msg.num_turns} turns · ${cost}`))
   writeLine(C.dim(`  ${tokenParts.join(" · ")}`))
+  writeLine(C.dim(`  Session: ${msg.session_id}`))
 }
 
 function renderControlRequest(msg: SDKControlRequestMessage) {
   if (msg.request.subtype === "can_use_tool") {
-    const toolName = (msg.request as any).tool_name ?? "Tool"
-    const input = (msg.request as any).input ?? {}
-    clearSpinnerLine()
+    const toolName = String(msg.request.tool_name ?? "Tool")
+    const input = (msg.request.input ?? {}) as Record<string, unknown>
     writeLine(C.warning(`${INDENT}⚠ Permission: ${C.bold(toolName)} ${formatToolInput(toolName, input)}`))
   }
 }
 
 // ─── Formatting helpers ───
 
+const TOOL_DISPLAY_NAMES: Record<string, string> = {
+  Bash: "Bash", Read: "Read", Edit: "Edit", Write: "Write",
+  Glob: "Search", Grep: "Search", Agent: "Agent", WebFetch: "Fetch",
+  TodoWrite: "Todo", TaskCreate: "Task", TaskUpdate: "Task",
+  TaskList: "Task", TaskGet: "Task",
+}
+
 function toolDisplayName(name: string): string {
-  const map: Record<string, string> = {
-    Bash: "Bash", Read: "Read", Edit: "Edit", Write: "Write",
-    Glob: "Search", Grep: "Search", Agent: "Agent", WebFetch: "Fetch",
-  }
-  return map[name] ?? name
+  return TOOL_DISPLAY_NAMES[name] ?? name
 }
 
 function formatToolInput(name: string, input: Record<string, unknown>): string {
@@ -477,12 +520,15 @@ function formatToolInput(name: string, input: Record<string, unknown>): string {
       }
       return `(${cmd.length > 120 ? cmd.slice(0, 120) + "…" : cmd})`
     }
-    case "Read":  return `(${relativePath(String(input.file_path ?? ""))})`
-    case "Edit": {
-      const p = relativePath(String(input.file_path ?? ""))
-      return input.old_string === "" ? `(creating ${p})` : `(${p})`
+    case "Read":
+    case "Write": {
+      const fp = relativePath(String(input.file_path ?? ""))
+      return `(${fp})`
     }
-    case "Write": return `(${relativePath(String(input.file_path ?? ""))})`
+    case "Edit": {
+      const fp = relativePath(String(input.file_path ?? ""))
+      return input.old_string === "" ? `(creating ${fp})` : `(${fp})`
+    }
     case "Grep":
     case "Glob": {
       const pat = String(input.pattern ?? "")
@@ -493,11 +539,31 @@ function formatToolInput(name: string, input: Record<string, unknown>): string {
       const desc = String(input.description ?? input.prompt ?? "")
       return `(${desc.slice(0, 80)})`
     }
+    case "TodoWrite": {
+      const todos = input.todos
+      if (!Array.isArray(todos) || todos.length === 0) return ""
+      const summary = todos.map((t: Record<string, unknown>) => {
+        const status = t.status === "completed" ? "✓" : t.status === "in_progress" ? "⧖" : "○"
+        const content = String(t.content ?? "").slice(0, 40)
+        return `${status} ${content}`
+      })
+      return `(${todos.length} items: ${summary.join(", ").slice(0, 120)})`
+    }
+    case "TaskCreate": {
+      const subject = String(input.subject ?? "")
+      return `(${subject.slice(0, 80)})`
+    }
+    case "TaskUpdate": {
+      const id = String(input.taskId ?? "")
+      const status = input.status ? ` → ${input.status}` : ""
+      return `(#${id}${status})`
+    }
     default: {
       const keys = Object.keys(input)
       if (keys.length === 0) return ""
-      const val = String(input[keys[0]])
-      return `(${keys[0]}: ${val.slice(0, 80)})`
+      const v = input[keys[0]]
+      const val = (typeof v === "object" && v !== null) ? JSON.stringify(v).slice(0, 80) : String(v).slice(0, 80)
+      return `(${keys[0]}: ${val})`
     }
   }
 }
@@ -531,7 +597,7 @@ function summarizeResult(toolName: string, result: string, isError?: boolean): s
   }
 }
 
-function getToolResultText(block: any): string {
+function getToolResultText(block: ToolResultBlock): string {
   if (typeof block.content === "string") return block.content
   if (Array.isArray(block.content)) {
     return block.content
@@ -542,9 +608,10 @@ function getToolResultText(block: any): string {
   return ""
 }
 
+const cachedCwd = process.cwd() + "/"
+
 function relativePath(p: string): string {
-  const cwd = process.cwd() + "/"
-  return p.startsWith(cwd) ? p.slice(cwd.length) : p
+  return p.startsWith(cachedCwd) ? p.slice(cachedCwd.length) : p
 }
 
 function formatDuration(ms: number): string {

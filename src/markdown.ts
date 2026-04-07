@@ -7,32 +7,26 @@
 
 import chalk from "chalk"
 import { marked, type Token, type Tokens } from "marked"
+import { stripAnsi } from "./utils.js"
 
 const EOL = "\n"
 
-let configured = false
-
-function configure() {
-  if (configured) return
-  configured = true
-  // Disable strikethrough — model often uses ~ for "approximate"
-  marked.use({
-    tokenizer: {
-      del() {
-        return undefined
-      },
+// Disable strikethrough — model often uses ~ for "approximate"
+marked.use({
+  tokenizer: {
+    del() {
+      return undefined
     },
-  })
-}
+  },
+})
 
 /**
  * Render a markdown string to ANSI-styled terminal text.
  */
 export function renderMarkdown(content: string): string {
-  configure()
   return marked
     .lexer(content)
-    .map(t => formatToken(t, 0, null, null))
+    .map(t => renderTokens([t]))
     .join("")
     .trim()
 }
@@ -45,7 +39,6 @@ export function renderMarkdown(content: string): string {
  *   - rest: raw text of the last incomplete token to keep in buffer
  */
 export function renderMarkdownStreaming(buffer: string): { output: string; rest: string } {
-  configure()
   const tokens = marked.lexer(buffer)
 
   if (tokens.length === 0) {
@@ -66,13 +59,13 @@ export function renderMarkdownStreaming(buffer: string): { output: string; rest:
   // Render all stable tokens (everything except the last content token and trailing spaces)
   const stable = tokens.slice(0, lastContentIdx)
   const output = stable
-    .map(t => formatToken(t, 0, null, null))
+    .map(t => renderTokens([t]))
     .join("")
     .trimStart()
 
   // Reconstruct the raw text of the unstable tail
   const lastToken = tokens[lastContentIdx]!
-  const rest = buffer.slice((lastToken as any).raw ? getRawOffset(tokens, lastContentIdx, buffer) : 0)
+  const rest = buffer.slice((lastToken as any).raw ? getRawOffset(tokens, lastContentIdx) : 0)
 
   return { output, rest }
 }
@@ -81,12 +74,17 @@ export function renderMarkdownStreaming(buffer: string): { output: string; rest:
  * Get the byte offset in the original string where token at `idx` starts.
  * We sum up the raw lengths of all preceding tokens.
  */
-function getRawOffset(tokens: Token[], idx: number, _buffer: string): number {
+function getRawOffset(tokens: Token[], idx: number): number {
   let offset = 0
   for (let i = 0; i < idx; i++) {
     offset += (tokens[i] as any).raw?.length ?? 0
   }
   return offset
+}
+
+/** Render child tokens with default context (top-level, no list). */
+function renderTokens(tokens: Token[] | undefined, parent: Token | null = null): string {
+  return (tokens ?? []).map(t => formatToken(t, 0, null, parent)).join("")
 }
 
 function formatToken(
@@ -97,9 +95,7 @@ function formatToken(
 ): string {
   switch (token.type) {
     case "blockquote": {
-      const inner = (token.tokens ?? [])
-        .map(t => formatToken(t, 0, null, null))
-        .join("")
+      const inner = renderTokens(token.tokens)
       const bar = chalk.dim("│")
       return inner
         .split(EOL)
@@ -117,25 +113,14 @@ function formatToken(
       return chalk.cyan(token.text)
 
     case "em":
-      return chalk.italic(
-        (token.tokens ?? [])
-          .map(t => formatToken(t, 0, null, parent))
-          .join(""),
-      )
+      return chalk.italic(renderTokens(token.tokens, parent))
 
     case "strong":
-      return chalk.underline(
-        (token.tokens ?? [])
-          .map(t => formatToken(t, 0, null, parent))
-          .join(""),
-      )
+      return chalk.underline(renderTokens(token.tokens, parent))
 
     case "heading": {
       const prefix = "#".repeat(token.depth)
-      const text = (token.tokens ?? [])
-        .map(t => formatToken(t, 0, null, null))
-        .join("")
-      return chalk.underline(`${prefix} ${text}`) + EOL
+      return chalk.underline(`${prefix} ${renderTokens(token.tokens)}`) + EOL
     }
 
     case "hr":
@@ -145,9 +130,7 @@ function formatToken(
       return token.href
 
     case "link": {
-      const linkText = (token.tokens ?? [])
-        .map(t => formatToken(t, 0, null, token))
-        .join("")
+      const linkText = renderTokens(token.tokens, token)
       if (linkText && linkText !== token.href) {
         return `${linkText} ${chalk.dim(`(${token.href})`)}`
       }
@@ -157,40 +140,25 @@ function formatToken(
     case "list":
       return token.items
         .map((item: Token, i: number) =>
-          formatToken(
-            item,
-            listDepth,
-            token.ordered ? token.start + i : null,
-            token,
-          ),
+          formatToken(item, listDepth, token.ordered ? token.start + i : null, token),
         )
         .join("")
 
     case "list_item":
       return (token.tokens ?? [])
-        .map(
-          t =>
-            `${"  ".repeat(listDepth)}${formatToken(t, listDepth + 1, orderedNum, token)}`,
-        )
+        .map(t => `${"  ".repeat(listDepth)}${formatToken(t, listDepth + 1, orderedNum, token)}`)
         .join("")
 
     case "paragraph":
-      return (
-        (token.tokens ?? [])
-          .map(t => formatToken(t, 0, null, null))
-          .join("") + EOL
-      )
+      return renderTokens(token.tokens) + EOL
 
     case "space":
-      return EOL
-
     case "br":
       return EOL
 
     case "text": {
       if (parent?.type === "list_item") {
-        const bullet =
-          orderedNum === null ? "-" : `${orderedNum}.`
+        const bullet = orderedNum === null ? "-" : `${orderedNum}.`
         const inner = token.tokens
           ? token.tokens.map(t => formatToken(t, listDepth, orderedNum, token)).join("")
           : token.text
@@ -207,49 +175,39 @@ function formatToken(
     case "table": {
       const tableToken = token as Tokens.Table
 
-      function getDisplayWidth(tokens: Token[] | undefined): number {
-        const text = tokens
-          ?.map(t => formatToken(t, 0, null, null))
-          .join("") ?? ""
-        return stripAnsi(text).length
+      // Pre-render all cells: { content: ANSI string, width: display width }
+      interface CellInfo { content: string; width: number }
+      function renderCell(tokens: Token[] | undefined): CellInfo {
+        const content = renderTokens(tokens)
+        return { content, width: stripAnsi(content).length }
       }
 
-      // Column widths
-      const colWidths = tableToken.header.map((h, i) => {
-        let max = getDisplayWidth(h.tokens)
-        for (const row of tableToken.rows) {
-          max = Math.max(max, getDisplayWidth(row[i]?.tokens))
+      const headerCells = tableToken.header.map(h => renderCell(h.tokens))
+      const rowCells = tableToken.rows.map(row => row.map(cell => renderCell(cell.tokens)))
+
+      // Column widths (single pass)
+      const colWidths = headerCells.map((h, i) => {
+        let max = h.width
+        for (const row of rowCells) {
+          max = Math.max(max, row[i]?.width ?? 0)
         }
         return Math.max(max, 3)
       })
 
-      // Header
       let out = "| "
-      tableToken.header.forEach((h, i) => {
-        const content = h.tokens
-          ?.map(t => formatToken(t, 0, null, null))
-          .join("") ?? ""
-        const w = getDisplayWidth(h.tokens)
-        out += pad(content, w, colWidths[i]!) + " | "
+      headerCells.forEach((h, i) => {
+        out += pad(h.content, h.width, colWidths[i]!) + " | "
       })
       out = out.trimEnd() + EOL
 
-      // Separator
       out += "|"
-      colWidths.forEach(w => {
-        out += "-".repeat(w + 2) + "|"
-      })
+      colWidths.forEach(w => { out += "-".repeat(w + 2) + "|" })
       out += EOL
 
-      // Rows
-      tableToken.rows.forEach(row => {
+      rowCells.forEach(row => {
         out += "| "
         row.forEach((cell, i) => {
-          const content = cell.tokens
-            ?.map(t => formatToken(t, 0, null, null))
-            .join("") ?? ""
-          const w = getDisplayWidth(cell.tokens)
-          out += pad(content, w, colWidths[i]!) + " | "
+          out += pad(cell.content, cell.width, colWidths[i]!) + " | "
         })
         out = out.trimEnd() + EOL
       })
@@ -270,12 +228,6 @@ function formatToken(
 }
 
 // ─── Helpers ───
-
-const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g
-
-function stripAnsi(s: string): string {
-  return s.replace(ANSI_RE, "")
-}
 
 function pad(content: string, displayWidth: number, targetWidth: number): string {
   const padding = Math.max(0, targetWidth - displayWidth)
