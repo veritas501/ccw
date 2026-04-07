@@ -5,10 +5,12 @@ A lightweight CLI wrapper for [Claude Code](https://docs.anthropic.com/en/docs/c
 ## Features
 
 - Real-time streaming text with colored output
-- Thinking spinner with elapsed time and token count
+- Multi-phase spinner: thinking → talking → tool-input → tool-use
+- Markdown rendering with ANSI styling (headings, bold, code, tables, etc.)
 - Collapsible tool call groups (Read/Grep/Glob auto-collapse)
-- Bash and Edit tool calls rendered individually with input summary
-- Session result summary (duration, turns, cost)
+- Tool calls rendered individually with input summary and result preview
+- Session result summary (duration, turns, cost, tokens)
+- Typed SDK message handling (no `as any`)
 - Pipe-friendly: accepts prompt from stdin or CLI args
 
 ## Requirements
@@ -87,6 +89,8 @@ src/
   types.ts      — TypeScript definitions for Claude stream-json protocol
   parser.ts     — NDJSON line parser with partial-line buffering
   renderer.ts   — Terminal renderer with spinner, tool groups, colored output
+  markdown.ts   — Streaming markdown-to-ANSI renderer (using marked lexer + chalk)
+  utils.ts      — Shared utilities (stripAnsi)
 ```
 
 ## License
