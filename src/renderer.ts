@@ -9,6 +9,7 @@
  */
 
 import chalk from "chalk"
+import { renderMarkdown, renderMarkdownStreaming } from "./markdown.js"
 import type {
   SDKMessage,
   SDKAssistantMessage,
@@ -124,6 +125,18 @@ function clearSpinnerLine() {
 }
 
 // ─── Output helpers ───
+
+/**
+ * Streaming flush: parse buffer, render completed tokens, keep last
+ * (possibly incomplete) token in buffer.
+ */
+function flushTextParagraphs() {
+  const { output, rest } = renderMarkdownStreaming(textLineBuf)
+  if (output) {
+    write(output)
+  }
+  textLineBuf = rest
+}
 
 function write(s: string) {
   process.stdout.write(s)
@@ -282,12 +295,8 @@ function renderStreamEvent(msg: SDKStreamEventMessage) {
       if (delta.type === "text_delta" && delta.text) {
         stopSpinner()
         textLineBuf += delta.text
-        // Flush complete lines
-        let idx: number
-        while ((idx = textLineBuf.indexOf("\n")) !== -1) {
-          writeLine(C.claude(textLineBuf.slice(0, idx)))
-          textLineBuf = textLineBuf.slice(idx + 1)
-        }
+        // Flush on paragraph boundary (double newline)
+        flushTextParagraphs()
       } else if (delta.type === "thinking_delta") {
         // Count thinking tokens for spinner display
         outputTokens++
@@ -326,9 +335,12 @@ function renderStreamEvent(msg: SDKStreamEventMessage) {
 
     case "message_stop": {
       stopSpinner()
-      // Flush remaining text buffer
+      // Render remaining text as markdown
       if (textLineBuf) {
-        write(C.claude(textLineBuf))
+        const rendered = renderMarkdown(textLineBuf)
+        if (rendered) {
+          write(rendered)
+        }
         textLineBuf = ""
       }
       if (textStarted) {
@@ -403,24 +415,37 @@ function renderResult(msg: SDKResultMessage) {
   if (toolGroup.length > 0) flushToolGroup()
 
   writeLine()
-  writeLine(C.dim("─".repeat(40)))
 
   if (msg.subtype === "success") {
-    writeLine(C.success(`${INDENT}✓ Completed`))
+    writeLine(C.success("● Done"))
   } else {
-    writeLine(C.error(`${INDENT}✗ ${formatErrorSubtype(msg.subtype)}`))
+    writeLine(C.error(`● ${formatErrorSubtype(msg.subtype)}`))
     if ("errors" in msg && msg.errors) {
       for (const err of msg.errors) {
-        writeLine(C.error(`${INDENT}  ${err}`))
+        writeLine(C.error(`  ${err}`))
       }
     }
   }
 
   const duration    = formatDuration(msg.duration_ms)
   const apiDuration = formatDuration(msg.duration_api_ms)
-  writeLine(C.dim(
-    `${INDENT}Duration: ${duration} (API: ${apiDuration})  Turns: ${msg.num_turns}  Cost: $${msg.total_cost_usd.toFixed(4)}`
-  ))
+  const cost        = `$${msg.total_cost_usd.toFixed(4)}`
+
+  // Token stats
+  const usage = (msg as any).usage
+  const input   = usage?.input_tokens ?? 0
+  const output  = usage?.output_tokens ?? 0
+  const cacheR  = usage?.cache_read_input_tokens ?? 0
+  const cacheW  = usage?.cache_creation_input_tokens ?? 0
+
+  const tokenParts: string[] = []
+  tokenParts.push(`${formatTokenCount(input)} in`)
+  tokenParts.push(`${formatTokenCount(output)} out`)
+  if (cacheR > 0) tokenParts.push(`${formatTokenCount(cacheR)} cache read`)
+  if (cacheW > 0) tokenParts.push(`${formatTokenCount(cacheW)} cache write`)
+
+  writeLine(C.dim(`  ${duration} (API ${apiDuration}) · ${msg.num_turns} turns · ${cost}`))
+  writeLine(C.dim(`  ${tokenParts.join(" · ")}`))
 }
 
 function renderControlRequest(msg: SDKControlRequestMessage) {
@@ -527,6 +552,12 @@ function formatDuration(ms: number): string {
   const s = ms / 1000
   if (s < 60) return `${s.toFixed(1)}s`
   return `${Math.floor(s / 60)}m ${Math.floor(s % 60)}s`
+}
+
+function formatTokenCount(n: number): string {
+  if (n < 1000) return `${n}`
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`
+  return `${(n / 1_000_000).toFixed(2)}M`
 }
 
 function formatErrorSubtype(subtype: string): string {

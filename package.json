@@ -9,11 +9,12 @@
     "start": "bun run src/index.ts",
     "dev": "bun run src/index.ts",
     "build": "bun build --compile src/index.ts --outfile dist/ccw",
-    "install:local": "bun run build && install -m 755 dist/ccw ~/.local/bin/ccw",
-    "uninstall:local": "rm -f ~/.local/bin/ccw"
+    "install": "bun run build && install -m 755 dist/ccw ~/.local/bin/ccw",
+    "uninstall": "rm -f ~/.local/bin/ccw"
   },
   "dependencies": {
-    "chalk": "^5.4.1"
+    "chalk": "^5.4.1",
+    "marked": "^18.0.0"
   },
   "devDependencies": {
     "@types/bun": "latest",
