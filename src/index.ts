@@ -11,7 +11,7 @@
 
 import { spawn } from "child_process"
 import { createParser } from "./parser.js"
-import { render, resetState } from "./renderer.js"
+import { render, resetState, printFinalSummary } from "./renderer.js"
 
 // ─── CLI args ───
 
@@ -67,6 +67,7 @@ if (!process.stdin.isTTY) {
 
 // Handle child exit
 child.on("close", (code) => {
+  printFinalSummary()
   process.exit(code ?? 0)
 })
 

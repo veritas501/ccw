@@ -75,6 +75,7 @@ let outputTokens = 0
 let spinnerTimer: ReturnType<typeof setInterval> | null = null
 let spinnerMode: SpinnerMode = "thinking"
 let spinnerToolName = ""
+let sessionId = ""
 
 export function resetState() {
   toolGroup = []
@@ -88,7 +89,15 @@ export function resetState() {
   spinFrame = 0
   spinnerMode = "thinking"
   spinnerToolName = ""
+  sessionId = ""
   stopSpinner()
+}
+
+/** Print final session summary on process exit. */
+export function printFinalSummary(): void {
+  if (sessionId) {
+    process.stdout.write(C.dim(`Session: ${sessionId}\n`))
+  }
 }
 
 // ─── Spinner ───
@@ -270,6 +279,7 @@ function renderSystem(msg: SDKSystemMessage) {
     case "init": {
       const initMsg = msg as SDKSystemInitMessage
       const model = stripAnsi(initMsg.model ?? "unknown")
+      if (initMsg.session_id) sessionId = initMsg.session_id
       writeLine(C.dim(`Model: ${model}  Session: ${initMsg.session_id}`))
       break
     }
@@ -455,6 +465,9 @@ function renderResult(msg: SDKResultMessage) {
   stopSpinner()
   if (toolGroup.length > 0) flushToolGroup()
 
+  // Store session_id for final summary on process exit
+  if (msg.session_id) sessionId = msg.session_id
+
   writeLine()
 
   if (msg.subtype === "success") {
@@ -486,7 +499,6 @@ function renderResult(msg: SDKResultMessage) {
 
   writeLine(C.dim(`  ${duration} (API ${apiDuration}) · ${msg.num_turns} turns · ${cost}`))
   writeLine(C.dim(`  ${tokenParts.join(" · ")}`))
-  writeLine(C.dim(`  Session: ${msg.session_id}`))
 }
 
 function renderControlRequest(msg: SDKControlRequestMessage) {
